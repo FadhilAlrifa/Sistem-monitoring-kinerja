@@ -36,18 +36,38 @@ const isAdmin = (req, res, next) => {
 };
 
 const canEdit = async (req, res, next) => {
-    // PERBAIKAN KRITIS: Pastikan req.body TIDAK UNDEFINED
+    // Amankan req.body dari undefined
     const requestBody = req.body || {}; 
-    const unitId = requestBody.id_unit || req.query.id_unit || req.params.id_unit;
+    const reportId = req.params.id; // ID Laporan untuk PUT/DELETE
+
+    // 1. Dapatkan Unit ID yang relevan. Prioritas: Body > URL Params.
+    let unitId = requestBody.id_unit;
+
+    // 2. Jika Unit ID tidak ditemukan di body (kasus DELETE), kita cari di DB menggunakan ID Laporan
+    if (!unitId && reportId) {
+        // Asumsi: Kita mencari di tabel LaporanHarian untuk contoh ini.
+        // Dalam implementasi nyata, Anda perlu menentukan tabel mana (LaporanHarian/Penjumboan/Pemuatan)
+        try {
+            const [result] = await pool.query('SELECT id_unit FROM LaporanHarian WHERE id_laporan = ?', [reportId]);
+            unitId = result[0]?.id_unit;
+        } catch (e) {
+            console.error('Error lookup unitId for DELETE:', e);
+            // Lanjutkan, biarkan pengecekan di bawah gagal jika ID unit tidak ditemukan
+        }
+    }
     
-    const userGroups = req.user.allowed_groups;
+    const userGroups = req.user?.allowed_groups;
+    const userRole = req.user?.role;
 
-    if (req.user.role === 'superuser') return next(); 
+    // 3. BYPASS UTAMA UNTUK SUPERUSER
+    if (userRole === 'superuser') return next(); 
 
-    if (req.user.role !== 'entry_admin') {
+    // 4. PENGECEKAN ROLE
+    if (userRole !== 'entry_admin') {
          return res.status(403).json({ message: 'Akses ditolak. Peran tidak memiliki izin input.' });
     }
 
+    // 5. PENGECEKAN DATA GROUP (SETELAH ID UNIT DIPEROLEH)
     if (!unitId || !userGroups) {
         return res.status(400).json({ message: 'Payload unit kerja atau izin grup tidak lengkap.' });
     }
@@ -79,7 +99,65 @@ const canEdit = async (req, res, next) => {
         return res.status(500).json({ message: 'Kesalahan server saat memverifikasi izin.' });
     }
 };
+const fetchRilisProduksiData = async (groupName, year) => {
+    const currentYear = parseInt(year);
 
+    const rilisQuery = `
+        SELECT 
+            uk.nama_unit,
+            MONTH(lpp.tanggal) AS month,
+            COALESCE(SUM(lpp.produksi_ton), 0) AS total_produksi_ton
+        FROM LaporanHarian lpp
+        JOIN UnitKerja uk ON lpp.id_unit = uk.id_unit
+        JOIN ProductionGroup pg ON uk.group_id = pg.group_id
+        WHERE pg.group_name = ? AND YEAR(lpp.tanggal) = ?
+        GROUP BY uk.nama_unit, month
+        ORDER BY month ASC
+    `;
+
+    const [rilisDataRaw] = await pool.query(rilisQuery, [groupName, currentYear]);
+    
+    // --- Logika Restrukturisasi Data (Pivoting) ---
+    const monthlyAggregatedData = {};
+    const monthNamesAbbr = ["JAN", "FEB", "MAR", "APR", "MEI", "JUN", "JUL", "AGU", "SEP", "OKT", "NOV", "DES"];
+
+    rilisDataRaw.forEach(item => {
+        const monthKey = item.month;
+        const unitName = item.nama_unit;
+        
+        if (!monthlyAggregatedData[monthKey]) {
+            monthlyAggregatedData[monthKey] = { 
+                month: monthKey, 
+                monthLabel: monthNamesAbbr[monthKey - 1]
+            };
+        }
+        monthlyAggregatedData[monthKey][unitName] = parseFloat(item.total_produksi_ton);
+    });
+
+    return Object.values(monthlyAggregatedData).sort((a, b) => a.month - b.month);
+};
+
+// API untuk Rilis Produksi PABRIK
+app.get('/api/produksi/pabrik/rilis/:year', async (req, res) => {
+    try {
+        const data = await fetchRilisProduksiData('Pabrik', req.params.year);
+        res.json(data);
+    } catch (err) {
+        console.error('Error fetching Pabrik Rilis data:', err);
+        res.status(500).json({ message: 'Server error saat mengambil data Rilis Pabrik.' });
+    }
+});
+
+// API untuk Rilis Produksi BKS
+app.get('/api/produksi/bks/rilis/:year', async (req, res) => {
+    try {
+        const data = await fetchRilisProduksiData('BKS', req.params.year);
+        res.json(data);
+    } catch (err) {
+        console.error('Error fetching BKS Rilis data:', err);
+        res.status(500).json({ message: 'Server error saat mengambil data Rilis BKS.' });
+    }
+});
 // ------------------------------------------------------------------
 // AUTH & MASTER DATA ENDPOINTS
 // ------------------------------------------------------------------
@@ -177,13 +255,43 @@ app.get('/api/laporan/all', authenticateToken, isAdmin, async (req, res) => {
 app.put('/api/laporan/:id', authenticateToken, canEdit, async (req, res) => {
     const { id } = req.params;
     const { tanggal, id_unit, produksi_ton, jam_operasi, h_proses, h_listrik, h_mekanik, h_operator, h_hujan, h_kapal, h_pmc } = req.body;
-    const query = `UPDATE LaporanHarian SET tanggal = ?, id_unit = ?, produksi_ton = ?, jam_operasi = ?, h_proses = ?, h_listrik = ?, h_mekanik = ?, h_operator = ?, h_hujan = ?, h_kapal = ?, h_pmc = ? WHERE id_laporan = ?`;
+    
+    // Pastikan SEMUA kolom dipisahkan dengan koma dan diakhiri sebelum WHERE
+    const query = `
+        UPDATE LaporanHarian SET 
+            tanggal = ?, 
+            id_unit = ?, 
+            produksi_ton = ?, 
+            jam_operasi = ?, 
+            h_proses = ?, 
+            h_listrik = ?, 
+            h_mekanik = ?, 
+            h_operator = ?, 
+            h_hujan = ?, 
+            h_kapal = ?, 
+            h_pmc = ? 
+        WHERE id_laporan = ?
+    `;
     const values = [tanggal, id_unit, produksi_ton, jam_operasi, h_proses, h_listrik, h_mekanik, h_operator, h_hujan, h_kapal, h_pmc, id];
+    
     try {
         const [result] = await pool.query(query, values);
-        if (result.affectedRows === 0) { return res.status(404).json({ message: 'Laporan tidak ditemukan.' }); }
+        
+        if (result.affectedRows === 0) { 
+            return res.status(404).json({ message: 'Laporan tidak ditemukan.' }); 
+        }
+        
         res.json({ message: 'Laporan berhasil diperbarui.' });
-    } catch (err) { console.error('Error updating report:', err); res.status(500).json({ message: 'Gagal memperbarui laporan.' }); }
+        
+    } catch (err) { 
+        console.error('Error updating report:', err); 
+        
+        if (err.errno === 1062) {
+            return res.status(409).json({ message: 'Gagal: Kombinasi Tanggal dan Unit Kerja sudah ada pada laporan lain.' });
+        }
+        
+        res.status(500).json({ message: 'Gagal memperbarui laporan.' }); 
+    }
 });
 
 // [DELETE] Menghapus Laporan Harian (PRODUKSI) (DILINDUNGI GROUP ADMIN)
@@ -401,6 +509,51 @@ app.delete('/api/packing-plant/laporan/:id', authenticateToken, canEdit, async (
         if (result.affectedRows === 0) { return res.status(404).json({ message: 'Laporan Packing Plant tidak ditemukan.' }); }
         res.json({ message: 'Laporan berhasil dihapus.' });
     } catch (err) { console.error('Error deleting packing plant report:', err); res.status(500).json({ message: 'Gagal menghapus laporan Packing Plant.' }); }
+});
+app.get('/api/packing-plant/rilis/:year', async (req, res) => {
+    const { year } = req.params;
+    const currentYear = parseInt(year);
+
+    const rilisQuery = `
+        SELECT 
+            uk.nama_unit,
+            MONTH(lpp.tanggal) AS month,
+            COALESCE(SUM(lpp.ton_muat), 0) AS total_muat_ton
+        FROM LaporanPackingPlant lpp
+        JOIN UnitKerja uk ON lpp.id_unit = uk.id_unit
+        JOIN ProductionGroup pg ON uk.group_id = pg.group_id
+        WHERE pg.group_name = 'Packing Plant' AND YEAR(lpp.tanggal) = ?
+        GROUP BY uk.nama_unit, month
+        ORDER BY month ASC
+    `;
+
+    try {
+        const [rilisDataRaw] = await pool.query(rilisQuery, [currentYear]);
+        
+        // Data perlu di-restrukturisasi agar Recharts dapat membuat Grouped Bar Chart
+        // [ {month: 1, "PP Makassar": 1000, "PP Palu": 500}, ... ]
+        const monthlyAggregatedData = {};
+
+        rilisDataRaw.forEach(item => {
+            const monthKey = item.month;
+            const unitName = item.nama_unit;
+            
+            if (!monthlyAggregatedData[monthKey]) {
+                monthlyAggregatedData[monthKey] = { 
+                    month: monthKey, 
+                    monthLabel: ['JAN', 'FEB', 'MAR', 'APR', 'MEI', 'JUN', 'JUL', 'AGU', 'SEP', 'OKT', 'NOV', 'DES'][monthKey - 1]
+                };
+            }
+            monthlyAggregatedData[monthKey][unitName] = parseFloat(item.total_muat_ton);
+        });
+
+        const finalData = Object.values(monthlyAggregatedData).sort((a, b) => a.month - b.month);
+        res.json(finalData);
+
+    } catch (err) {
+        console.error('Error fetching Rilis Packing Plant data:', err);
+        res.status(500).json({ message: 'Server error saat mengambil data rilis Packing Plant.' });
+    }
 });
 
 // ------------------------------------------------------------------
